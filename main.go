@@ -36,6 +36,9 @@ func main() {
 	} else if mode == "d" {
 		fmt.Println("Starting dequeuer")
 		BulkDequeuer(messageCount, queue_url)
+	} else if mode == "bd" {
+		fmt.Println("Starting batch dequeuer")
+		BulkBatchDequeuer(messageCount, queue_url)
 	} else {
 		fmt.Println("Invalid Flag, Exiting")
 		return
@@ -70,10 +73,50 @@ func BulkDequeuer(itemsCount uint64, queue_url string) {
 			for {
 				latency := dequeue(queue_url)
 				if count >= itemsCount {
-					fmt.Println("Average Latency for last item is ", totalLatency / count)
+					fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
 					break
 				}
 				if latency != 0 {
+					atomic.AddUint64(&count, 1)
+					atomic.AddUint64(&totalLatency, latency)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
+	var totalLatency, count uint64
+	count = 1
+	var wg sync.WaitGroup
+	wg.Add(deque_parallelism)
+	for i:=0; i<deque_parallelism; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				messages := batchDequeue(queue_url)
+				for j:=0; j<len(messages); j++ {
+					// Get latency in nanoseconds between enqueue and dequeue
+					message := messages[j]
+					enqueue_time := *message.MessageAttributes["EnqueueTime"].StringValue
+					enqueue_time_nanosec, _ := strconv.ParseUint(enqueue_time, 10, 0)
+					latency := uint64(time.Now().UnixNano()) - enqueue_time_nanosec
+					//fmt.Println("Latency(ns): ", latency, count)
+
+					// Delete the message after successful dequeue
+					_, err := sqs_client.DeleteMessage(&sqs.DeleteMessageInput{
+						QueueUrl:      &queue_url,
+						ReceiptHandle: message.ReceiptHandle,
+					})
+					if err != nil {
+						fmt.Println("Delete Error: ", err)
+						os.Exit(1)
+					}
+					if count >= itemsCount {
+						fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
+						return
+					}
 					atomic.AddUint64(&count, 1)
 					atomic.AddUint64(&totalLatency, latency)
 				}
@@ -191,7 +234,7 @@ func dequeue(queue_url string) (uint64){
 		return 0
 	}
 
-	// Print latency in nanoseconds between enqueue and dequeue
+	// Get latency in nanoseconds between enqueue and dequeue
 	message := result.Messages[0]
 	enqueue_time := *message.MessageAttributes["EnqueueTime"].StringValue
 	enqueue_time_nanosec, _ := strconv.ParseUint(enqueue_time, 10, 0)
@@ -209,6 +252,27 @@ func dequeue(queue_url string) (uint64){
 	}
 
 	return latency
+}
+
+// Returns max(=10) messages
+func batchDequeue(queue_url string) []*sqs.Message {
+	result, err := sqs_client.ReceiveMessage(&sqs.ReceiveMessageInput{
+		AttributeNames: []*string{
+		    aws.String(sqs.MessageSystemAttributeNameSentTimestamp),    // Get only sent timestamp
+		},
+		MessageAttributeNames: []*string{
+		    aws.String(sqs.QueueAttributeNameAll),      // Get all message attributes
+		},
+		QueueUrl:            &queue_url,
+		MaxNumberOfMessages: aws.Int64(10),     // Returns 10 message
+		VisibilityTimeout:   aws.Int64(1),      // Make message invisible for 1 second
+		WaitTimeSeconds:     aws.Int64(0),      // Short polling
+	})
+	if err != nil {
+		fmt.Println("Dequeue Error: ", err)
+		os.Exit(1)
+	}
+	return result.Messages
 }
 
 func createSQSQueue() string {
