@@ -96,6 +96,7 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 			defer wg.Done()
 			for {
 				messages := batchDequeue(queue_url)
+				var entries []*sqs.DeleteMessageBatchRequestEntry
 				for j:=0; j<len(messages); j++ {
 					// Get latency in nanoseconds between enqueue and dequeue
 					message := messages[j]
@@ -104,21 +105,29 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 					latency := uint64(time.Now().UnixNano()) - enqueue_time_nanosec
 					//fmt.Println("Latency(ns): ", latency, count)
 
-					// Delete the message after successful dequeue
-					_, err := sqs_client.DeleteMessage(&sqs.DeleteMessageInput{
-						QueueUrl:      &queue_url,
+					// Append entries for batch delete
+					id := fmt.Sprintf("%d", count)
+					entries = append(entries, &sqs.DeleteMessageBatchRequestEntry{
+						Id: &id,
 						ReceiptHandle: message.ReceiptHandle,
 					})
-					if err != nil {
-						fmt.Println("Delete Error: ", err)
-						os.Exit(1)
-					}
 					if count >= itemsCount {
 						fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
 						os.Exit(1) // Note: Change this to return statement for benchmarking
 					}
 					atomic.AddUint64(&count, 1)
 					atomic.AddUint64(&totalLatency, latency)
+				}
+				// Batch delete
+				if len(entries) > 0 {
+					_, err := sqs_client.DeleteMessageBatch(&sqs.DeleteMessageBatchInput{
+						QueueUrl:      &queue_url,
+						Entries:       entries,
+					})
+					if err != nil {
+						fmt.Println("Batch Delete Error: ", err)
+						os.Exit(1)
+					}
 				}
 			}
 		}()
