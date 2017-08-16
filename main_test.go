@@ -24,3 +24,13 @@ func BenchmarkBulkDequeuer(b *testing.B) {
                 BulkDequeuer(100, queue_url)
         }
 }
+
+func BenchmarkBulkBatchDequeuer(b *testing.B) {
+	createSQSClient()
+	queue_url := createSQSQueue()
+
+	b.ResetTimer()
+        for n := 0; n < b.N; n++ {
+                BulkBatchDequeuer(100, queue_url)
+        }
+}

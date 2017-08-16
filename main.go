@@ -29,7 +29,7 @@ func main() {
 	createSQSClient()
 	queue_url := createSQSQueue()
 	message := getMessage()
-	mode := os.Getenv("mode")       // Use "export mode=e" or "export mode=d"
+	mode := os.Getenv("mode")       // Use "export mode=e" or "export mode=d" or "export mode=bd"
 	if mode == "e" {
 		fmt.Println("Starting enqueuer")
 		BulkEnqueuer(messageCount, queue_url, message)
@@ -115,7 +115,7 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 					}
 					if count >= itemsCount {
 						fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
-						return
+						os.Exit(1) // Note: Change this to return statement for benchmarking
 					}
 					atomic.AddUint64(&count, 1)
 					atomic.AddUint64(&totalLatency, latency)
