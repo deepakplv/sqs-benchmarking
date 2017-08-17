@@ -113,7 +113,7 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 					})
 					if count >= itemsCount {
 						fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
-						os.Exit(1) // Note: Change this to return statement for benchmarking
+						return
 					}
 					atomic.AddUint64(&count, 1)
 					atomic.AddUint64(&totalLatency, latency)
