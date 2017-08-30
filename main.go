@@ -14,14 +14,19 @@ import (
 	"encoding/json"
 	"sync/atomic"
 	"sync"
+	"bufio"
 )
 
 const (
-	region = "us-east-1"
+	region = "eu-west-2"
 	queue_name = "benchmark-queue"
 	messageCount = 10000
 	enque_parallelism = 10
 	deque_parallelism = 10
+
+	// Time bound enque/deque
+	runtimeDuration = time.Minute * 1
+	enqueuingWorkers = 300
 )
 var sqs_client *sqs.SQS
 
@@ -29,16 +34,22 @@ func main() {
 	createSQSClient()
 	queue_url := createSQSQueue()
 	message := getMessage()
-	mode := os.Getenv("mode")       // Use "export mode=e" or "export mode=d" or "export mode=bd"
+	mode := os.Getenv("mode")       // Use "export mode=e" or "export mode=d" or "export mode=bd" etc.
 	if mode == "e" {
 		fmt.Println("Starting enqueuer")
 		BulkEnqueuer(messageCount, queue_url, message)
+	} else if mode == "tbe" {
+		fmt.Println("Starting time bound enqueuer for duration: ", runtimeDuration)
+		TimeBoundEnqueuer(runtimeDuration, queue_url, message)
 	} else if mode == "d" {
 		fmt.Println("Starting dequeuer")
 		BulkDequeuer(messageCount, queue_url)
 	} else if mode == "bd" {
 		fmt.Println("Starting batch dequeuer")
 		BulkBatchDequeuer(messageCount, queue_url)
+	} else if mode == "tbbd" {
+		fmt.Println("Starting time bound batch dequeuer")
+		TimeBoundBatchDequeuer(runtimeDuration, queue_url)
 	} else {
 		fmt.Println("Invalid Flag, Exiting")
 		return
@@ -60,6 +71,23 @@ func BulkEnqueuer(itemsCount uint64, queue_url string, message string) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TimeBoundEnqueuer(totalDuration time.Duration, queue_url string, message string) {
+	var count uint64
+	for i:=0; i<enqueuingWorkers; i++ {
+		go func() {
+			for {
+				enqueue(queue_url, count, message)
+				atomic.AddUint64(&count, 1)
+			}
+		}()
+	}
+	select {
+	        case <- time.After(totalDuration):
+	                fmt.Println(count) // This may not be correct count as goroutines are still running
+	                os.Exit(1)
+        }
 }
 
 func BulkDequeuer(itemsCount uint64, queue_url string) {
@@ -91,6 +119,7 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 	count = 1
 	var wg sync.WaitGroup
 	wg.Add(deque_parallelism)
+	var latencyList []uint64
 	for i:=0; i<deque_parallelism; i++ {
 		go func() {
 			defer wg.Done()
@@ -117,6 +146,8 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 					}
 					atomic.AddUint64(&count, 1)
 					atomic.AddUint64(&totalLatency, latency)
+					// Add latency to list after converting from nano to millisecond
+					latencyList = append(latencyList, latency/1000000)
 				}
 				// Batch delete
 				if len(entries) > 0 {
@@ -133,6 +164,93 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 		}()
 	}
 	wg.Wait()
+
+	// Create a file and write the latencies
+	file, err := os.Create("/tmp/latencies1.txt")
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+        w := bufio.NewWriter(file)
+	for _, latency := range latencyList {
+                fmt.Fprintln(w, latency)
+        }
+	if err = w.Flush(); err != nil {
+                panic(err)
+        }
+}
+
+func TimeBoundBatchDequeuer(totalDuration time.Duration, queue_url string) {
+	var totalLatency, count uint64
+	count = 0
+	var latencyList []uint64
+
+	// Create a file to write latencies
+	file, err := os.Create("/tmp/latencies2.txt")
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+        w := bufio.NewWriter(file)
+
+	for i:=0; i<deque_parallelism; i++ {
+		go func() {
+			for {
+				messages := batchDequeue(queue_url)
+				var entries []*sqs.DeleteMessageBatchRequestEntry
+				for j:=0; j<len(messages); j++ {
+					// Get latency in nanoseconds between enqueue and dequeue
+					message := messages[j]
+					enqueue_time := *message.MessageAttributes["EnqueueTime"].StringValue
+					enqueue_time_nanosec, _ := strconv.ParseUint(enqueue_time, 10, 0)
+					latency := uint64(time.Now().UnixNano()) - enqueue_time_nanosec
+					//fmt.Println("Latency(ns): ", latency, count)
+
+					// Append entries for batch delete
+					id := fmt.Sprintf("%d", count)
+					entries = append(entries, &sqs.DeleteMessageBatchRequestEntry{
+						Id: &id,
+						ReceiptHandle: message.ReceiptHandle,
+					})
+					atomic.AddUint64(&count, 1)
+					atomic.AddUint64(&totalLatency, latency)
+					// Add latency to list after converting from nano to millisecond
+					latencyList = append(latencyList, latency/1000000)
+				}
+				// Batch delete
+				if len(entries) > 0 {
+					_, err := sqs_client.DeleteMessageBatch(&sqs.DeleteMessageBatchInput{
+						QueueUrl:      &queue_url,
+						Entries:       entries,
+					})
+					if err != nil {
+						fmt.Println("Batch Delete Error: ", err)
+						os.Exit(1)
+					}
+				}
+				// Write accumulated latencies to the file
+				if count % 10000 == 0 {
+					for _, latency := range latencyList {
+                                                fmt.Fprintln(w, latency)
+                                        }
+					latencyList = latencyList[:0]   // Empty the list
+				}
+			}
+		}()
+	}
+	select {
+		// Duration(plus some buffer time) is over, so exit dequeuer
+	        case <- time.After(totalDuration+(time.Second*30)):
+	                // Write remaining latencies to the file
+	                for _, line := range latencyList {
+                                fmt.Fprintln(w, line)
+                        }
+	                if err = w.Flush(); err != nil {
+                                panic(err)
+                        }
+	                fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
+	                os.Exit(1)
+        }
 }
 
 // Enqueue and Dequeue one by one multiple times
@@ -216,7 +334,6 @@ func enqueue(queue_url string, index uint64, message string) {
         })
 	if err != nil {
 		fmt.Println("Enqueue Error:", err, result)
-		os.Exit(1)
 	}
 	//fmt.Println("Successfully enqueued messageID: ", *result.MessageId)
 }
@@ -236,7 +353,6 @@ func dequeue(queue_url string) (uint64){
 	})
 	if err != nil {
 		fmt.Println("Dequeue Error: ", err)
-		os.Exit(1)
 	}
 	if len(result.Messages) == 0 {
 		//fmt.Println("Dequeue Received no messages")
@@ -257,7 +373,6 @@ func dequeue(queue_url string) (uint64){
 	})
 	if err != nil {
 		fmt.Println("Delete Error: ", err)
-		os.Exit(1)
 	}
 
 	return latency
@@ -279,7 +394,6 @@ func batchDequeue(queue_url string) []*sqs.Message {
 	})
 	if err != nil {
 		fmt.Println("Dequeue Error: ", err)
-		os.Exit(1)
 	}
 	return result.Messages
 }
