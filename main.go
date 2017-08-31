@@ -25,7 +25,7 @@ const (
 	deque_parallelism = 10
 
 	// Time bound enque/deque
-	runtimeDuration = time.Minute * 1
+	runtimeDuration = time.Second * 60
 	enqueuingWorkers = 300
 )
 var sqs_client *sqs.SQS
@@ -48,7 +48,7 @@ func main() {
 		fmt.Println("Starting batch dequeuer")
 		BulkBatchDequeuer(messageCount, queue_url)
 	} else if mode == "tbbd" {
-		fmt.Println("Starting time bound batch dequeuer")
+		fmt.Println("Starting time bound batch dequeuer for duration: ", runtimeDuration)
 		TimeBoundBatchDequeuer(runtimeDuration, queue_url)
 	} else {
 		fmt.Println("Invalid Flag, Exiting")
@@ -80,6 +80,7 @@ func TimeBoundEnqueuer(totalDuration time.Duration, queue_url string, message st
 			for {
 				enqueue(queue_url, count, message)
 				atomic.AddUint64(&count, 1)
+				time.Sleep(time.Millisecond*975)
 			}
 		}()
 	}
@@ -166,7 +167,7 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 	wg.Wait()
 
 	// Create a file and write the latencies
-	file, err := os.Create("/tmp/latencies1.txt")
+	file, err := os.Create("/tmp/sqs_latencies.txt")
 	if err != nil {
 		panic(err)
 	}
@@ -182,16 +183,7 @@ func BulkBatchDequeuer(itemsCount uint64, queue_url string) {
 
 func TimeBoundBatchDequeuer(totalDuration time.Duration, queue_url string) {
 	var totalLatency, count uint64
-	count = 0
 	var latencyList []uint64
-
-	// Create a file to write latencies
-	file, err := os.Create("/tmp/latencies2.txt")
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-        w := bufio.NewWriter(file)
 
 	for i:=0; i<deque_parallelism; i++ {
 		go func() {
@@ -225,29 +217,31 @@ func TimeBoundBatchDequeuer(totalDuration time.Duration, queue_url string) {
 					})
 					if err != nil {
 						fmt.Println("Batch Delete Error: ", err)
-						os.Exit(1)
 					}
-				}
-				// Write accumulated latencies to the file
-				if count % 10000 == 0 {
-					for _, latency := range latencyList {
-                                                fmt.Fprintln(w, latency)
-                                        }
-					latencyList = latencyList[:0]   // Empty the list
 				}
 			}
 		}()
 	}
 	select {
-		// Duration(plus some buffer time) is over, so exit dequeuer
+		// Duration(plus some buffer time) is over, so write latencies to a file and exit dequeuer
 	        case <- time.After(totalDuration+(time.Second*30)):
-	                // Write remaining latencies to the file
-	                for _, line := range latencyList {
-                                fmt.Fprintln(w, line)
-                        }
+	                // Create a file and write the latencies
+			file, err := os.Create("/tmp/sqs_time_bound_latencies.txt")
+			if err != nil {
+				panic(err)
+			}
+			defer file.Close()
+		        w := bufio.NewWriter(file)
+			for _, latency := range latencyList {
+		                fmt.Fprintln(w, latency)
+		        }
+			if err = w.Flush(); err != nil {
+		                panic(err)
+		        }
 	                if err = w.Flush(); err != nil {
                                 panic(err)
                         }
+
 	                fmt.Println("Average Latency for ", count, "th item is ", totalLatency / count)
 	                os.Exit(1)
         }
